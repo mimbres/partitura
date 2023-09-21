@@ -4660,14 +4660,17 @@ def unfold_part_alignment(part, alignment):
     for n in alignment:
         if n["label"] == "match" or n["label"] == "deletion":
             alignment_ids.append(n["score_id"])
-
+    
     score_variants = make_score_variants(part)
 
     alignment_score_ids = np.zeros((len(alignment_ids), len(score_variants)))
     unfolded_part_length = np.zeros(len(score_variants))
     for j, sv in enumerate(score_variants):
         u_part = sv.create_variant_part()
-        update_note_ids_after_unfolding(u_part)
+        u_part_note_ids = [n.id for n in u_part.notes]
+        # check if the alignment ids contain repetition flags, but also check if score ids alr contain flags (i.e. vienna4x22)
+        if any('-' in nid for nid in alignment_ids) and not any('-' in nid for nid in u_part_note_ids): 
+            update_note_ids_after_unfolding(u_part)
         unfolded_parts.append(u_part)
         u_part_ids = [n.id for n in u_part.notes_tied]
         unfolded_part_length[j] = len(u_part_ids)
@@ -4681,14 +4684,13 @@ def unfold_part_alignment(part, alignment):
     if len(best_idx) > 1:
         best_idx = best_idx[unfolded_part_length[best_idx].argmin()]
 
-    # append "-1" to alignment if the score_id's in alignment
-    if not any(["-1" in al.get("score_id", "") for al in alignment]):
-        for n in alignment:
-            if "score_id" in n:
-                n["score_id"] = f"{n['score_id']}-1"
-
+    # # append "-1" to alignment if the score_id's in alignment
+    # if not any(["-1" in al.get("score_id", "") for al in alignment]):
+    #     for n in alignment:
+    #         if "score_id" in n:
+    #             n["score_id"] = f"{n['score_id']}-1" # this part seems questionable
+    
     return unfolded_parts[int(best_idx)]
-
 
 # UPDATED
 def make_score_variants(part):

@@ -17,10 +17,10 @@ from scipy.optimize import least_squares
 from scipy.signal import find_peaks
 from scipy.integrate import quad
 import numpy.lib.recfunctions as rfn
-from partitura.score import ScoreLike
+from partitura.score import ScoreLike, Score, Part, unfold_part_alignment, unfold_part_maximal, merge_parts
 from partitura.performance import PerformanceLike, PerformedPart
 from partitura.utils.generic import interp1d
-from partitura.musicanalysis.performance_codec import to_matched_score, onsetwise_to_notewise, encode_tempo
+from partitura.musicanalysis.performance_codec import to_matched_score, onsetwise_to_notewise, encode_tempo, get_unique_onset_idxs
 
 
 __all__ = [
@@ -146,7 +146,7 @@ def compute_matched_score(score: ScoreLike,
     m_score : np strutured array
     unique_onset_idxs : list
     """
-
+    
     m_score, _ = to_matched_score(score, performance, alignment, include_score_markings=True)
     (time_params, unique_onset_idxs) = encode_tempo(
         score_onsets=m_score["onset"],
@@ -628,6 +628,8 @@ def pedal_feature(m_score : list,
     # plt.plot(x, y)
     # plt.show()
 
+    # This raises an IntegrationWarning: The maximum number of subdivisions (50) has been achieved.  If increasing the limit yields no improvement it is advised to analyze the integrand in order to determine the difficulties.  If the position of a local difficulty can be determined (singularity, discontinuity) one will probably gain from splitting up the interval and calling the integrator on the subranges.  Perhaps a special-purpose integrator should be used.
+    # res = quad(ramp_func, -np.inf, np.inf, limit=1000)
     res = quad(ramp_func, -np.inf, np.inf)
     average_pedal = res[0] / final_time
     average_pedal = np.full(len(m_score), average_pedal, dtype=[("average_pedal", "f4")])
@@ -674,10 +676,10 @@ def pedal_ramp(ppart: PerformedPart,
 ### Phrasing
 
 def phrasing_feature(m_score : List, 
-                        unique_onset_idxs : List, 
-                        performance : PerformanceLike, 
-                        plot : bool = False,
-                        **kwargs):
+                    unique_onset_idxs : List, 
+                    performance : PerformanceLike, 
+                    plot : bool = False,
+                    **kwargs):
     """
     Unfinished! after finishing will update to phrasing_feature
     rubato:
@@ -701,8 +703,9 @@ def phrasing_feature(m_score : List,
     """
 
     endings = get_phrase_end(m_score, unique_onset_idxs)
-    phrasing_ = np.zeros(len(m_score), dtype=[("rubato_w", "f4"), ("rubato_q", "f4")])     
-
+    print('Evaluating final phrase endings:', endings)
+    phrasing_ = np.zeros(len(m_score), dtype=[("end_rubato_w", "f4"), ("end_rubato_q", "f4")])
+    
     for i, ending in enumerate(endings):
         (start, end), (xdata, ydata) = ending
 
@@ -715,8 +718,8 @@ def phrasing_feature(m_score : List,
             res = least_squares(freiberg_kinematic, params_init, args=(xdata, ydata))
             
             w, q = res.x
-            phrasing_[start:end]['rubato_w'] = w
-            phrasing_[start:end]['rubato_q'] = q
+            phrasing_[start:end]['end_rubato_w'] = w
+            phrasing_[start:end]['end_rubato_q'] = q
 
             if plot:
                 plt.scatter(xdata, ydata, marker="+", c="red")
@@ -725,8 +728,199 @@ def phrasing_feature(m_score : List,
                 plt.ylim(0, 1.2)
                 plt.title(f"Friberg & Sundberg kinematic rubato curve with w={round(w, 2)} and q={round(q, 2)}")
                 plt.show()
-
+    
     return {"features": phrasing_}
+
+
+def get_segment_boundaries(segment_annotations_csv, type = 'beat'):
+    '''
+    Retrieve segment boundaries from annotated score parts from csv files
+    
+    Parameters
+    ----------
+    segment_annotations_csv : csv file 
+        annotated score part stored as .csv, which has in addition to the standard note array features also the columns mn, uoi, sb:
+            - mn: int -- the measure number, starting with 0 if piece starts with anacrusis
+            - uoi: int -- onset index
+            - sb: bool -- True if phrase starts at that onset
+    
+    Returns
+    ----------
+    segments_onset_beat : list
+        list of 
+    
+    '''
+    spart_annotated = np.genfromtxt(segment_annotations_csv, delimiter=',', dtype=None, names=True, encoding=None)
+    if type == 'beat':
+        segment_onsets = np.unique(spart_annotated[spart_annotated['sb'] == 1]['onset_beat'])
+
+    return segment_onsets
+
+def add_segment_boundaries_to_spart(spart, save_path=None):
+    """Save a score part object as a csv with additional mn, uoi and sb fields.
+
+    Arguments:
+        score : Score
+
+    Keyword Arguments:
+        save_path : Path
+            path where spart csv should be stored
+    """
+    
+    sna = spart.note_array()
+
+    # add measure info
+    # NOTE: for mozart and schubert pieces in vienna4x22, measure numbers are not correct (musicxml is already unfolded)
+    measures = spart.measure_number_map(spart.note_array()["onset_div"])
+    # correct for pickup measure
+    if sna[0]['onset_beat'] < 0:
+        measures = measures-1
+     
+    # add onset info
+    unique_snotes_onset_idxs, _ = get_unique_onset_idxs(spart.note_array()["onset_beat"], return_unique_onsets=True)
+    note_to_onset_mask = np.zeros((len(spart.note_array()),), dtype=int)
+    for i in range(len(unique_snotes_onset_idxs)):
+        note_to_onset_mask[unique_snotes_onset_idxs[i]] = i
+    # add column for segment boundaries
+    sb = np.zeros(len(measures), dtype=np.int8)
+    
+    sna = np.lib.recfunctions.rec_append_fields(sna, ['mn', 'uoi', 'sb'], [measures, note_to_onset_mask, sb])
+
+    print(",".join(list(sna.dtype.names)))
+    header = ",".join(list(sna.dtype.names))
+
+    np.savetxt(save_path, sna, fmt='%s',delimiter=",",header=header, comments='')
+    
+    return None
+
+def segment_feature_curves(feature_onset_array, phrases_onset_beat):
+    """
+    Segment a feature curve into phrases given a list of phrase beginning beat onsets.
+
+    Arguments:
+        feature_onset_array : structured array
+            a structured array of records in the form (onset_beat, feature_value)
+        phrases_onset_beat : list
+            a list of beat onsets where each onset represents the start of a phrase
+    
+    Returns:
+        phrasewise_feature_curves : list
+            list of structured arrays, each containing the feature values for a phrase
+    """
+    
+    phrasewise_feature_curves = []
+    for i, segment_start_beat in enumerate(phrases_onset_beat):
+        if i == 0:
+            phrase = feature_onset_array[np.where(feature_onset_array['onset'] < segment_start_beat)]        
+        elif i == (len(phrases_onset_beat)-1):
+            phrase = [feature_onset_array[np.where((feature_onset_array['onset'] >= phrases_onset_beat[i-1]) & (feature_onset_array['onset'] < segment_start_beat))], feature_onset_array[np.where(feature_onset_array['onset'] >= segment_start_beat)]]
+        else:
+            phrase = feature_onset_array[np.where((feature_onset_array['onset'] >= phrases_onset_beat[i-1]) & (feature_onset_array['onset'] < phrases_onset_beat[i]))]
+            
+        if len(phrase) == 2:
+            phrasewise_feature_curves.extend(phrase)
+        else: phrasewise_feature_curves.append(phrase)
+    
+    return phrasewise_feature_curves
+
+def compute_phrase_strength(phrase_feature_curve, return_max_vel_beat_onset=False):
+    """Compute the phrase strength as the average velocity / tempo difference between the phrase feature peak and its two adjoining minima
+
+    Arguments:
+        phrase_feature_curve : structured array
+            a structured array of records in the form (onset_beat, feature_value)
+
+    Keyword Arguments:
+        return_max_vel_beat_onset : bool
+            return the beat onset where the max occurs
+
+    Returns:
+        phrase strength : float
+            value indicating the clarity of phrase
+        max_vel_onset : float
+            location of phrase feature peak
+    """
+    
+    max_idx = np.argmax(phrase_feature_curve['velocity'])
+    max_vel = phrase_feature_curve['velocity'][max_idx]
+    max_vel_onset = phrase_feature_curve['onset'][max_idx]
+    
+    if max_idx != 0:
+        min_left_idx = np.argmin(phrase_feature_curve['velocity'][:max_idx])
+        min_left_vel = phrase_feature_curve['velocity'][min_left_idx]
+        min_left_onset = phrase_feature_curve['onset'][min_left_idx]
+        
+        if min_left_onset == phrase_feature_curve['onset'][0]: warnings.warn('min left adjacent is at segment start')    
+    else: 
+        min_left_vel = max_vel
+        warnings.warn('No left adjacent local minimum')
+        
+    if max_idx != (phrase_feature_curve.shape[0]-1):
+        min_right_idx = np.argmin(phrase_feature_curve['velocity'][max_idx+1:])
+        min_right_vel = phrase_feature_curve['velocity'][max_idx+1:][min_right_idx]
+        min_right_onset = phrase_feature_curve['onset'][max_idx+1:][min_right_idx]
+        
+        if min_right_onset == phrase_feature_curve['onset'][-1]: warnings.warn('min right adjacent is at segment end') 
+    else:
+        min_right_vel = max_vel
+        warnings.warn('No right adjacent local minimum')
+        
+    phrase_strength = 1/2 * ((max_vel-min_left_vel) + (max_vel-min_right_vel))
+    
+    if return_max_vel_beat_onset == True:
+        return phrase_strength, max_vel_onset
+    else: return phrase_strength
+
+def compute_phrase_strength_aggregates(phrasewise_feature_curves):
+    """
+    Compute the average phr
+
+    Arguments:
+        phrasewise_feature_curves : list
+            list of structured arrays, each containing the feature values for a phrase
+
+    Returns:
+        ps_mean : float
+            average phrase strength of phrases in a performance
+        ps_std : float
+            variability of phrase strength values
+            
+    """
+    phrase_strength_array = np.zeros(len(phrasewise_feature_curves))
+    
+    for i, sv in enumerate(phrasewise_feature_curves):
+        phrase_strength = compute_phrase_strength(sv)
+        phrase_strength_array[i] = phrase_strength
+    
+    ps_mean = np.round(np.mean(phrase_strength_array), 4)
+    ps_std = np.round(np.std(phrase_strength_array), 4)
+    
+    return ps_mean, ps_std
+
+def apply_smoothing_measure_window(feature_data, score, feature='velocity'):
+    '''
+    Apply gaussian smoothing with a measure-sized window
+    # TODO: currently measurewise window smooths out a lot, try setting stdd with fwhm
+    '''
+
+    if len(score.parts[0].time_sigs) == 1:
+        window_size = score.parts[0].time_sigs[0].beats # num
+    else: print('Multiple timesigs!')    
+    
+    onsets = feature_data['onset']
+    feature_values = feature_data[feature]    
+    smoothed_values = np.zeros_like(feature_values)
+
+    for i, onset in enumerate(onsets):
+        
+        weights = np.exp(-(onsets - onset) ** 2 / (2 * window_size ** 2))
+        smoothed_values[i] = np.sum(weights * feature_values) / np.sum(weights)
+
+    smoothed_data = np.core.records.fromarrays([onsets, smoothed_values], dtype=[('onset', '<f4'), ('velocity', '<i4')])
+
+    return smoothed_data
+
+
 
 
 def freiberg_kinematic(params, xdata, ydata):
